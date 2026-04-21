@@ -190,6 +190,16 @@
     pointer-events: none;
   }
 
+  .seg-marker {
+    position: absolute;
+    top: -3px;
+    width: 1px;
+    height: 12px;
+    background: rgba(255,255,255,0.25);
+    pointer-events: none;
+    z-index: 1;
+  }
+
   #button-row {
     display: flex;
     align-items: center;
@@ -315,10 +325,14 @@
 <script>
 // ═══════════════════════════════════════════════════════════
 // CONFIGURATION — swap in your own videos here
+// Each segment has a duration (seconds) and 6 video URLs.
+// Duration is declared up front so the continuous timeline
+// can be built without loading every video.
 // ═══════════════════════════════════════════════════════════
 const segments = [
   {
-    label: "Segment 1 — 00:00–01:00",
+    label: "Segment 1",
+    duration: 60,
     videos: [
       "videos/seg1_cam1.mp4",
       "videos/seg1_cam2.mp4",
@@ -329,7 +343,8 @@ const segments = [
     ]
   },
   {
-    label: "Segment 2 — 01:00–02:00",
+    label: "Segment 2",
+    duration: 60,
     videos: [
       "videos/seg2_cam1.mp4",
       "videos/seg2_cam2.mp4",
@@ -342,16 +357,38 @@ const segments = [
 ];
 
 const NUM_CAMS = 6;
-const SYNC_THRESHOLD = 0.2; // resync if drift > 200ms
+const SYNC_THRESHOLD = 0.2;
+
+// ═══════════════════════════════════════════════════════════
+// PRECOMPUTE SEGMENT OFFSETS & TOTAL DURATION
+// segStarts[i] = global time where segment i begins
+// ═══════════════════════════════════════════════════════════
+const segStarts = [];
+let totalDuration = 0;
+for (const seg of segments) {
+  segStarts.push(totalDuration);
+  totalDuration += seg.duration;
+}
+
+// Given a global time, return { segIndex, localTime }
+function resolveGlobalTime(globalTime) {
+  globalTime = Math.max(0, Math.min(totalDuration - 0.001, globalTime));
+  for (let i = segments.length - 1; i >= 0; i--) {
+    if (globalTime >= segStarts[i]) {
+      return { segIndex: i, localTime: globalTime - segStarts[i] };
+    }
+  }
+  return { segIndex: 0, localTime: 0 };
+}
 
 // ═══════════════════════════════════════════════════════════
 // STATE
 // ═══════════════════════════════════════════════════════════
-let currentSegment = 0;
+let currentSegment = -1;  // which segment's videos are loaded
 let isPlaying = false;
 let isScrubbing = false;
 let videos = [];
-let segmentDuration = 0;
+let segmentLoaded = false;  // true once current segment's videos are ready
 
 // ═══════════════════════════════════════════════════════════
 // DOM REFS
@@ -393,7 +430,7 @@ function log(msg) {
 }
 
 // ═══════════════════════════════════════════════════════════
-// BUILD GRID
+// BUILD GRID (once)
 // ═══════════════════════════════════════════════════════════
 function buildGrid() {
   grid.innerHTML = '';
@@ -407,7 +444,7 @@ function buildGrid() {
     `;
     const vid = document.createElement('video');
     vid.playsInline = true;
-    vid.setAttribute('playsinline', '');  // iOS needs the attribute
+    vid.setAttribute('playsinline', '');
     vid.setAttribute('webkit-playsinline', '');
     vid.preload = 'auto';
     vid.muted = true;
@@ -416,7 +453,6 @@ function buildGrid() {
     grid.appendChild(cell);
     videos.push(vid);
 
-    // Error logging per video
     vid.addEventListener('error', () => {
       const err = vid.error;
       log(`Cam ${i+1} error: ${err ? err.code + ' ' + err.message : 'unknown'}`);
@@ -426,28 +462,52 @@ function buildGrid() {
 }
 
 // ═══════════════════════════════════════════════════════════
-// LOAD SEGMENT
+// BUILD SEGMENT MARKERS ON TIMELINE
 // ═══════════════════════════════════════════════════════════
-function loadSegment(idx, andPlay = false) {
+function buildSegmentMarkers() {
+  // Add a tick at each segment boundary (skip first)
+  for (let i = 1; i < segments.length; i++) {
+    const pct = (segStarts[i] / totalDuration) * 100;
+    const marker = document.createElement('div');
+    marker.className = 'seg-marker';
+    marker.style.left = pct + '%';
+    timelineTrack.appendChild(marker);
+  }
+}
+
+// ═══════════════════════════════════════════════════════════
+// LOAD SEGMENT (only when needed)
+// ═══════════════════════════════════════════════════════════
+function loadSegment(idx, startLocalTime = 0, andPlay = false) {
   if (idx < 0 || idx >= segments.length) return;
-  log(`Loading segment ${idx + 1}`);
+  if (idx === currentSegment && segmentLoaded) {
+    // Already loaded — just seek
+    seekLocal(startLocalTime);
+    if (andPlay && !isPlaying) playAll();
+    return;
+  }
+
+  log(`Loading segment ${idx + 1} at local ${startLocalTime.toFixed(1)}s`);
   currentSegment = idx;
+  segmentLoaded = false;
   const seg = segments[idx];
 
-  segInfo.textContent = seg.label;
+  segInfo.textContent = `${seg.label} (${idx + 1}/${segments.length})`;
   segNav.textContent = `Segment ${idx + 1} / ${segments.length}`;
 
+  // Pause while loading
+  const wantPlay = andPlay || isPlaying;
   pauseAll();
 
   let loadedCount = 0;
   const onReady = () => {
     loadedCount++;
-    log(`Video loaded (${loadedCount}/${NUM_CAMS})`);
     if (loadedCount >= NUM_CAMS) {
-      segmentDuration = videos[0].duration || 0;
-      log(`All loaded. Duration: ${segmentDuration.toFixed(1)}s`);
-      updateTimeline(0);
-      if (andPlay) playAll();
+      segmentLoaded = true;
+      log(`Segment ${idx + 1} ready`);
+      seekLocal(startLocalTime);
+      updateTimelineFromGlobal();
+      if (wantPlay) playAll();
     }
   };
 
@@ -455,21 +515,39 @@ function loadSegment(idx, andPlay = false) {
     const vid = videos[i];
     const cell = vid.closest('.cam-cell');
     cell.classList.remove('error', 'playing');
-
-    // Clear old handlers
     vid.oncanplaythrough = null;
-    vid.onloadedmetadata = null;
 
     vid.src = seg.videos[i];
     vid.currentTime = 0;
 
-    // Use canplaythrough for more reliable ready signal
-    vid.oncanplaythrough = function handler() {
+    vid.oncanplaythrough = function() {
       vid.oncanplaythrough = null;
       onReady();
     };
-
     vid.load();
+  }
+}
+
+function seekLocal(time) {
+  time = Math.max(0, time);
+  videos.forEach(v => { v.currentTime = time; });
+}
+
+// ═══════════════════════════════════════════════════════════
+// GLOBAL TIME HELPERS
+// ═══════════════════════════════════════════════════════════
+function getGlobalTime() {
+  if (currentSegment < 0 || !segmentLoaded) return 0;
+  return segStarts[currentSegment] + (videos[0].currentTime || 0);
+}
+
+function seekGlobal(globalTime) {
+  const { segIndex, localTime } = resolveGlobalTime(globalTime);
+  if (segIndex === currentSegment && segmentLoaded) {
+    seekLocal(localTime);
+    updateTimelineFromGlobal();
+  } else {
+    loadSegment(segIndex, localTime, isPlaying);
   }
 }
 
@@ -480,15 +558,10 @@ function playAll() {
   log('playAll()');
   isPlaying = true;
   updatePlayButton();
-
-  // Play all videos, starting from primary
-  const playPromises = videos.map((v, i) => {
+  videos.forEach((v, i) => {
     const p = v.play();
     v.closest('.cam-cell').classList.add('playing');
-    if (p && p.catch) {
-      p.catch(err => log(`Cam ${i+1} play failed: ${err.message}`));
-    }
-    return p;
+    if (p && p.catch) p.catch(err => log(`Cam ${i+1} play err: ${err.message}`));
   });
 }
 
@@ -509,8 +582,7 @@ function updatePlayButton() {
 
 function syncVideos() {
   if (!isPlaying || videos.length === 0) return;
-  const primary = videos[0];
-  const t = primary.currentTime;
+  const t = videos[0].currentTime;
   for (let i = 1; i < videos.length; i++) {
     if (Math.abs(videos[i].currentTime - t) > SYNC_THRESHOLD) {
       videos[i].currentTime = t;
@@ -518,21 +590,15 @@ function syncVideos() {
   }
 }
 
-function seekAll(time) {
-  time = Math.max(0, Math.min(segmentDuration, time));
-  videos.forEach(v => { v.currentTime = time; });
-  updateTimeline(time);
-}
-
 // ═══════════════════════════════════════════════════════════
-// TIMELINE
+// CONTINUOUS TIMELINE
 // ═══════════════════════════════════════════════════════════
-function updateTimeline(time) {
-  if (!segmentDuration) return;
-  const pct = Math.min(100, (time / segmentDuration) * 100);
+function updateTimelineFromGlobal() {
+  const gt = getGlobalTime();
+  const pct = Math.min(100, (gt / totalDuration) * 100);
   timelineFill.style.width = pct + '%';
   timelineThumb.style.left = pct + '%';
-  timeDisplay.textContent = formatTime(time) + ' / ' + formatTime(segmentDuration);
+  timeDisplay.textContent = formatTime(gt) + ' / ' + formatTime(totalDuration);
 }
 
 function formatTime(s) {
@@ -541,44 +607,44 @@ function formatTime(s) {
   return String(m).padStart(2, '0') + ':' + String(sec).padStart(2, '0');
 }
 
-// Use requestAnimationFrame for smoother timeline updates
+// ═══════════════════════════════════════════════════════════
+// MAIN LOOP
+// ═══════════════════════════════════════════════════════════
 function tick() {
-  if (isPlaying && !isScrubbing && videos[0]) {
-    updateTimeline(videos[0].currentTime);
+  if (isPlaying && !isScrubbing && segmentLoaded) {
+    updateTimelineFromGlobal();
     syncVideos();
+
+    // Check if current segment ended → advance
+    const primary = videos[0];
+    if (primary.ended || primary.currentTime >= segments[currentSegment].duration - 0.05) {
+      if (currentSegment < segments.length - 1) {
+        log('Auto-advancing to next segment');
+        loadSegment(currentSegment + 1, 0, true);
+      } else {
+        pauseAll();
+        log('Reached end of all segments');
+      }
+    }
   }
   requestAnimationFrame(tick);
 }
 requestAnimationFrame(tick);
 
-// Auto-advance on primary video ended
-function setupEndedHandler() {
-  videos[0].addEventListener('ended', () => {
-    log('Primary video ended');
-    if (currentSegment < segments.length - 1) {
-      loadSegment(currentSegment + 1, true);
-    } else {
-      pauseAll();
-      seekAll(0);
-    }
-  });
-}
-
 // ═══════════════════════════════════════════════════════════
-// SCRUB INTERACTION
+// SCRUB (continuous)
 // ═══════════════════════════════════════════════════════════
 function scrubFromEvent(e) {
   const rect = timelineTrack.getBoundingClientRect();
   const clientX = e.touches ? e.touches[0].clientX : e.clientX;
   const ratio = Math.max(0, Math.min(1, (clientX - rect.left) / rect.width));
-  const time = ratio * segmentDuration;
-  seekAll(time);
+  const globalTime = ratio * totalDuration;
+  seekGlobal(globalTime);
 }
 
 timelineContainer.addEventListener('pointerdown', (e) => {
   isScrubbing = true;
   scrubFromEvent(e);
-
   const onMove = (ev) => { ev.preventDefault(); scrubFromEvent(ev); };
   const onUp = () => {
     isScrubbing = false;
@@ -590,34 +656,42 @@ timelineContainer.addEventListener('pointerdown', (e) => {
 });
 
 // ═══════════════════════════════════════════════════════════
-// BUTTON HANDLERS
+// BUTTONS
 // ═══════════════════════════════════════════════════════════
 btnPlay.addEventListener('click', () => {
   if (isPlaying) pauseAll(); else playAll();
 });
 
 btnPrev.addEventListener('click', () => {
-  if (currentSegment > 0) loadSegment(currentSegment - 1, isPlaying);
+  // Jump to start of current segment, or previous if already near start
+  const localTime = videos[0] ? videos[0].currentTime : 0;
+  if (localTime > 1 && currentSegment >= 0) {
+    seekGlobal(segStarts[currentSegment]);
+  } else if (currentSegment > 0) {
+    seekGlobal(segStarts[currentSegment - 1]);
+  }
 });
 
 btnNext.addEventListener('click', () => {
-  if (currentSegment < segments.length - 1) loadSegment(currentSegment + 1, isPlaying);
+  if (currentSegment < segments.length - 1) {
+    seekGlobal(segStarts[currentSegment + 1]);
+  }
 });
 
 // Keyboard
 document.addEventListener('keydown', (e) => {
   if (e.code === 'Space') { e.preventDefault(); btnPlay.click(); }
-  if (e.code === 'ArrowLeft') seekAll(videos[0].currentTime - 5);
-  if (e.code === 'ArrowRight') seekAll(videos[0].currentTime + 5);
+  if (e.code === 'ArrowLeft') seekGlobal(getGlobalTime() - 5);
+  if (e.code === 'ArrowRight') seekGlobal(getGlobalTime() + 5);
 });
 
 // ═══════════════════════════════════════════════════════════
 // INIT
 // ═══════════════════════════════════════════════════════════
 buildGrid();
-setupEndedHandler();
-loadSegment(0);
-log('Player initialized');
+buildSegmentMarkers();
+loadSegment(0, 0, false);
+log(`Player init: ${segments.length} segments, ${formatTime(totalDuration)} total`);
 </script>
 </body>
 </html>
