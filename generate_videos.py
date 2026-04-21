@@ -5,7 +5,7 @@ from PIL import Image, ImageDraw, ImageFont
 
 W, H = 320, 240
 FPS = 15
-DURATION = 10  # seconds per video
+DURATION = 60  # seconds per video
 COLORS = [
     (26, 26, 46),   # cam1 - dark navy
     (22, 33, 62),   # cam2 - dark blue

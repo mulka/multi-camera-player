@@ -122,6 +122,10 @@
     box-shadow: 0 0 6px rgba(34,197,94,0.6);
   }
 
+  .cam-cell.error .status-dot {
+    background: #ef4444;
+  }
+
   /* ── Controls ── */
   #controls {
     flex-shrink: 0;
@@ -171,7 +175,6 @@
     background: var(--accent);
     border-radius: 3px;
     width: 0%;
-    transition: width 0.1s linear;
   }
 
   #timeline-thumb {
@@ -184,18 +187,6 @@
     background: #fff;
     border-radius: 50%;
     box-shadow: 0 0 6px var(--accent-glow);
-    pointer-events: none;
-    transition: left 0.1s linear;
-  }
-
-  /* Segment markers on timeline */
-  .seg-marker {
-    position: absolute;
-    top: -2px;
-    width: 2px;
-    height: 10px;
-    background: rgba(255,255,255,0.3);
-    border-radius: 1px;
     pointer-events: none;
   }
 
@@ -233,12 +224,28 @@
   }
 
   .ctrl-btn.primary:hover { background: #2563eb; }
-
   .ctrl-btn svg { width: 16px; height: 16px; fill: currentColor; }
 
   #segment-nav {
     font-size: 12px;
     color: var(--text-dim);
+  }
+
+  #debug-log {
+    position: fixed;
+    bottom: 120px;
+    left: 8px;
+    right: 8px;
+    max-height: 100px;
+    overflow-y: auto;
+    font-size: 10px;
+    color: #888;
+    background: rgba(0,0,0,0.8);
+    padding: 6px;
+    border-radius: 4px;
+    display: none;
+    z-index: 100;
+    font-family: monospace;
   }
 
   /* ── Responsive: phone portrait ── */
@@ -261,7 +268,6 @@
     .cam-label { font-size: 9px; top: 3px; left: 4px; }
   }
 
-  /* safe area for notched phones */
   @supports (padding: env(safe-area-inset-bottom)) {
     #controls { padding-bottom: calc(14px + env(safe-area-inset-bottom)); }
   }
@@ -272,7 +278,7 @@
 <div id="app">
   <div id="header">
     <h1>Multi-Camera Player</h1>
-    <span id="segment-info">—</span>
+    <span id="segment-info">Loading…</span>
   </div>
 
   <div id="grid"></div>
@@ -304,6 +310,8 @@
   </div>
 </div>
 
+<div id="debug-log"></div>
+
 <script>
 // ═══════════════════════════════════════════════════════════
 // CONFIGURATION — swap in your own videos here
@@ -334,7 +342,7 @@ const segments = [
 ];
 
 const NUM_CAMS = 6;
-const SYNC_THRESHOLD = 0.15; // resync if drift > 150ms
+const SYNC_THRESHOLD = 0.2; // resync if drift > 200ms
 
 // ═══════════════════════════════════════════════════════════
 // STATE
@@ -342,12 +350,11 @@ const SYNC_THRESHOLD = 0.15; // resync if drift > 150ms
 let currentSegment = 0;
 let isPlaying = false;
 let isScrubbing = false;
-let videos = [];           // current 6 <video> elements
-let primaryVideo = null;   // videos[0] drives the timeline
+let videos = [];
 let segmentDuration = 0;
 
 // ═══════════════════════════════════════════════════════════
-// DOM
+// DOM REFS
 // ═══════════════════════════════════════════════════════════
 const grid = document.getElementById('grid');
 const segInfo = document.getElementById('segment-info');
@@ -365,6 +372,27 @@ const btnPrev = document.getElementById('btn-prev');
 const btnNext = document.getElementById('btn-next');
 
 // ═══════════════════════════════════════════════════════════
+// DEBUG (triple-tap header to toggle)
+// ═══════════════════════════════════════════════════════════
+const debugEl = document.getElementById('debug-log');
+let debugOn = false;
+let tapCount = 0; let tapTimer = null;
+document.getElementById('header').addEventListener('click', () => {
+  tapCount++;
+  clearTimeout(tapTimer);
+  tapTimer = setTimeout(() => { tapCount = 0; }, 500);
+  if (tapCount >= 3) { debugOn = !debugOn; debugEl.style.display = debugOn ? 'block' : 'none'; tapCount = 0; }
+});
+function log(msg) {
+  console.log('[MCP]', msg);
+  if (!debugOn) return;
+  const line = document.createElement('div');
+  line.textContent = new Date().toLocaleTimeString() + ' ' + msg;
+  debugEl.appendChild(line);
+  debugEl.scrollTop = debugEl.scrollHeight;
+}
+
+// ═══════════════════════════════════════════════════════════
 // BUILD GRID
 // ═══════════════════════════════════════════════════════════
 function buildGrid() {
@@ -379,13 +407,22 @@ function buildGrid() {
     `;
     const vid = document.createElement('video');
     vid.playsInline = true;
+    vid.setAttribute('playsinline', '');  // iOS needs the attribute
+    vid.setAttribute('webkit-playsinline', '');
     vid.preload = 'auto';
-    vid.muted = true; // needed for autoplay policy
+    vid.muted = true;
+    vid.setAttribute('muted', '');
     cell.appendChild(vid);
     grid.appendChild(cell);
     videos.push(vid);
+
+    // Error logging per video
+    vid.addEventListener('error', () => {
+      const err = vid.error;
+      log(`Cam ${i+1} error: ${err ? err.code + ' ' + err.message : 'unknown'}`);
+      cell.classList.add('error');
+    });
   }
-  primaryVideo = videos[0];
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -393,47 +430,65 @@ function buildGrid() {
 // ═══════════════════════════════════════════════════════════
 function loadSegment(idx, andPlay = false) {
   if (idx < 0 || idx >= segments.length) return;
+  log(`Loading segment ${idx + 1}`);
   currentSegment = idx;
   const seg = segments[idx];
 
   segInfo.textContent = seg.label;
   segNav.textContent = `Segment ${idx + 1} / ${segments.length}`;
 
-  // Detach old event listeners by replacing videos
-  const wasPlaying = isPlaying;
   pauseAll();
 
-  const readyPromises = [];
+  let loadedCount = 0;
+  const onReady = () => {
+    loadedCount++;
+    log(`Video loaded (${loadedCount}/${NUM_CAMS})`);
+    if (loadedCount >= NUM_CAMS) {
+      segmentDuration = videos[0].duration || 0;
+      log(`All loaded. Duration: ${segmentDuration.toFixed(1)}s`);
+      updateTimeline(0);
+      if (andPlay) playAll();
+    }
+  };
+
   for (let i = 0; i < NUM_CAMS; i++) {
     const vid = videos[i];
+    const cell = vid.closest('.cam-cell');
+    cell.classList.remove('error', 'playing');
+
+    // Clear old handlers
+    vid.oncanplaythrough = null;
+    vid.onloadedmetadata = null;
+
     vid.src = seg.videos[i];
+    vid.currentTime = 0;
+
+    // Use canplaythrough for more reliable ready signal
+    vid.oncanplaythrough = function handler() {
+      vid.oncanplaythrough = null;
+      onReady();
+    };
+
     vid.load();
-    readyPromises.push(new Promise(resolve => {
-      vid.onloadeddata = resolve;
-      vid.onerror = resolve; // don't block on error
-    }));
   }
-
-  Promise.all(readyPromises).then(() => {
-    segmentDuration = primaryVideo.duration || 0;
-    updateTimeline(0);
-    if (andPlay || wasPlaying) playAll();
-  });
-
-  // Segment markers on timeline
-  const existingMarkers = timelineTrack.querySelectorAll('.seg-marker');
-  existingMarkers.forEach(m => m.remove());
 }
 
 // ═══════════════════════════════════════════════════════════
 // PLAY / PAUSE / SYNC
 // ═══════════════════════════════════════════════════════════
 function playAll() {
+  log('playAll()');
   isPlaying = true;
   updatePlayButton();
-  videos.forEach((v, i) => {
-    v.play().catch(() => {});
+
+  // Play all videos, starting from primary
+  const playPromises = videos.map((v, i) => {
+    const p = v.play();
     v.closest('.cam-cell').classList.add('playing');
+    if (p && p.catch) {
+      p.catch(err => log(`Cam ${i+1} play failed: ${err.message}`));
+    }
+    return p;
   });
 }
 
@@ -453,8 +508,9 @@ function updatePlayButton() {
 }
 
 function syncVideos() {
-  if (!primaryVideo || !isPlaying) return;
-  const t = primaryVideo.currentTime;
+  if (!isPlaying || videos.length === 0) return;
+  const primary = videos[0];
+  const t = primary.currentTime;
   for (let i = 1; i < videos.length; i++) {
     if (Math.abs(videos[i].currentTime - t) > SYNC_THRESHOLD) {
       videos[i].currentTime = t;
@@ -463,7 +519,9 @@ function syncVideos() {
 }
 
 function seekAll(time) {
+  time = Math.max(0, Math.min(segmentDuration, time));
   videos.forEach(v => { v.currentTime = time; });
+  updateTimeline(time);
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -483,23 +541,27 @@ function formatTime(s) {
   return String(m).padStart(2, '0') + ':' + String(sec).padStart(2, '0');
 }
 
-// Primary video drives the timeline
-function onTimeUpdate() {
-  if (isScrubbing) return;
-  updateTimeline(primaryVideo.currentTime);
-  syncVideos();
-}
-
-// Auto-advance to next segment
-function onEnded() {
-  if (currentSegment < segments.length - 1) {
-    loadSegment(currentSegment + 1, true);
-  } else {
-    pauseAll();
-    // Reset to beginning
-    seekAll(0);
-    updateTimeline(0);
+// Use requestAnimationFrame for smoother timeline updates
+function tick() {
+  if (isPlaying && !isScrubbing && videos[0]) {
+    updateTimeline(videos[0].currentTime);
+    syncVideos();
   }
+  requestAnimationFrame(tick);
+}
+requestAnimationFrame(tick);
+
+// Auto-advance on primary video ended
+function setupEndedHandler() {
+  videos[0].addEventListener('ended', () => {
+    log('Primary video ended');
+    if (currentSegment < segments.length - 1) {
+      loadSegment(currentSegment + 1, true);
+    } else {
+      pauseAll();
+      seekAll(0);
+    }
+  });
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -511,13 +573,13 @@ function scrubFromEvent(e) {
   const ratio = Math.max(0, Math.min(1, (clientX - rect.left) / rect.width));
   const time = ratio * segmentDuration;
   seekAll(time);
-  updateTimeline(time);
 }
 
 timelineContainer.addEventListener('pointerdown', (e) => {
   isScrubbing = true;
   scrubFromEvent(e);
-  const onMove = (ev) => scrubFromEvent(ev);
+
+  const onMove = (ev) => { ev.preventDefault(); scrubFromEvent(ev); };
   const onUp = () => {
     isScrubbing = false;
     window.removeEventListener('pointermove', onMove);
@@ -545,32 +607,17 @@ btnNext.addEventListener('click', () => {
 // Keyboard
 document.addEventListener('keydown', (e) => {
   if (e.code === 'Space') { e.preventDefault(); btnPlay.click(); }
-  if (e.code === 'ArrowLeft') { seekAll(Math.max(0, primaryVideo.currentTime - 5)); }
-  if (e.code === 'ArrowRight') { seekAll(Math.min(segmentDuration, primaryVideo.currentTime + 5)); }
+  if (e.code === 'ArrowLeft') seekAll(videos[0].currentTime - 5);
+  if (e.code === 'ArrowRight') seekAll(videos[0].currentTime + 5);
 });
 
 // ═══════════════════════════════════════════════════════════
 // INIT
 // ═══════════════════════════════════════════════════════════
 buildGrid();
-
-// Attach timeupdate + ended to primary video (re-attach on segment load)
-const attachPrimaryListeners = () => {
-  primaryVideo.addEventListener('timeupdate', onTimeUpdate);
-  primaryVideo.addEventListener('ended', onEnded);
-};
-
-// Use MutationObserver-like pattern: re-attach after src change
-const origLoadSegment = loadSegment;
-loadSegment = function(idx, andPlay) {
-  primaryVideo.removeEventListener('timeupdate', onTimeUpdate);
-  primaryVideo.removeEventListener('ended', onEnded);
-  origLoadSegment(idx, andPlay);
-  attachPrimaryListeners();
-};
-
-attachPrimaryListeners();
+setupEndedHandler();
 loadSegment(0);
+log('Player initialized');
 </script>
 </body>
 </html>
