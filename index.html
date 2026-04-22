@@ -295,7 +295,7 @@
 
   <div id="controls">
     <div id="timeline-row">
-      <span id="time-display">00:00 / 00:00</span>
+      <span id="time-display">--:--:-- --</span>
       <div id="timeline-container">
         <div id="timeline-track">
           <div id="timeline-fill"></div>
@@ -329,9 +329,13 @@
 // Duration is declared up front so the continuous timeline
 // can be built without loading every video.
 // ═══════════════════════════════════════════════════════════
+// Each segment has a wall-clock start time (ISO 8601 or any
+// Date-parseable string), a duration in seconds, and 6 video URLs.
+// The timeline is continuous and shows real timestamps.
+// Segments don't need to be contiguous — gaps are allowed.
 const segments = [
   {
-    label: "Segment 1",
+    startTime: "2026-04-21T12:00:00",
     duration: 60,
     videos: [
       "videos/seg1_cam1.mp4",
@@ -343,7 +347,7 @@ const segments = [
     ]
   },
   {
-    label: "Segment 2",
+    startTime: "2026-04-21T12:01:00",
     duration: 60,
     videos: [
       "videos/seg2_cam1.mp4",
@@ -360,25 +364,56 @@ const NUM_CAMS = 6;
 const SYNC_THRESHOLD = 0.2;
 
 // ═══════════════════════════════════════════════════════════
-// PRECOMPUTE SEGMENT OFFSETS & TOTAL DURATION
-// segStarts[i] = global time where segment i begins
+// PRECOMPUTE TIMELINE
+// The timeline spans from the first segment's start to the
+// last segment's end. Playable duration = sum of segment
+// durations. segOffsets[i] = playable seconds elapsed before
+// segment i starts.
 // ═══════════════════════════════════════════════════════════
-const segStarts = [];
-let totalDuration = 0;
+// Parse wall-clock times (ms since epoch)
 for (const seg of segments) {
-  segStarts.push(totalDuration);
-  totalDuration += seg.duration;
+  seg._startMs = new Date(seg.startTime).getTime();
+  seg._endMs = seg._startMs + seg.duration * 1000;
 }
 
-// Given a global time, return { segIndex, localTime }
-function resolveGlobalTime(globalTime) {
-  globalTime = Math.max(0, Math.min(totalDuration - 0.001, globalTime));
+// Playable offsets (only counting segment durations, no gaps)
+const segOffsets = [];
+let totalPlayable = 0;
+for (const seg of segments) {
+  segOffsets.push(totalPlayable);
+  totalPlayable += seg.duration;
+}
+const totalDuration = totalPlayable;
+
+// Wall-clock boundaries
+const timelineStartMs = segments[0]._startMs;
+const timelineEndMs = segments[segments.length - 1]._endMs;
+
+// Given a playable time (0 … totalDuration), find segment + local offset
+function resolvePlayableTime(pt) {
+  pt = Math.max(0, Math.min(totalDuration - 0.001, pt));
   for (let i = segments.length - 1; i >= 0; i--) {
-    if (globalTime >= segStarts[i]) {
-      return { segIndex: i, localTime: globalTime - segStarts[i] };
+    if (pt >= segOffsets[i]) {
+      return { segIndex: i, localTime: pt - segOffsets[i] };
     }
   }
   return { segIndex: 0, localTime: 0 };
+}
+
+// Convert playable time → wall-clock Date
+function playableToWallClock(pt) {
+  const { segIndex, localTime } = resolvePlayableTime(pt);
+  return new Date(segments[segIndex]._startMs + localTime * 1000);
+}
+
+// Format a Date as HH:MM:SS (12-hour with AM/PM)
+function formatWallClock(date) {
+  let h = date.getHours();
+  const m = String(date.getMinutes()).padStart(2, '0');
+  const s = String(date.getSeconds()).padStart(2, '0');
+  const ampm = h >= 12 ? 'PM' : 'AM';
+  h = h % 12 || 12;
+  return `${h}:${m}:${s} ${ampm}`;
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -465,9 +500,8 @@ function buildGrid() {
 // BUILD SEGMENT MARKERS ON TIMELINE
 // ═══════════════════════════════════════════════════════════
 function buildSegmentMarkers() {
-  // Add a tick at each segment boundary (skip first)
   for (let i = 1; i < segments.length; i++) {
-    const pct = (segStarts[i] / totalDuration) * 100;
+    const pct = (segOffsets[i] / totalDuration) * 100;
     const marker = document.createElement('div');
     marker.className = 'seg-marker';
     marker.style.left = pct + '%';
@@ -481,7 +515,6 @@ function buildSegmentMarkers() {
 function loadSegment(idx, startLocalTime = 0, andPlay = false) {
   if (idx < 0 || idx >= segments.length) return;
   if (idx === currentSegment && segmentLoaded) {
-    // Already loaded — just seek
     seekLocal(startLocalTime);
     if (andPlay && !isPlaying) playAll();
     return;
@@ -492,10 +525,11 @@ function loadSegment(idx, startLocalTime = 0, andPlay = false) {
   segmentLoaded = false;
   const seg = segments[idx];
 
-  segInfo.textContent = `${seg.label} (${idx + 1}/${segments.length})`;
+  const wallStart = formatWallClock(new Date(seg._startMs));
+  const wallEnd = formatWallClock(new Date(seg._endMs));
+  segInfo.textContent = `${wallStart} — ${wallEnd}`;
   segNav.textContent = `Segment ${idx + 1} / ${segments.length}`;
 
-  // Pause while loading
   const wantPlay = andPlay || isPlaying;
   pauseAll();
 
@@ -506,7 +540,7 @@ function loadSegment(idx, startLocalTime = 0, andPlay = false) {
       segmentLoaded = true;
       log(`Segment ${idx + 1} ready`);
       seekLocal(startLocalTime);
-      updateTimelineFromGlobal();
+      updateTimelineDisplay();
       if (wantPlay) playAll();
     }
   };
@@ -534,18 +568,18 @@ function seekLocal(time) {
 }
 
 // ═══════════════════════════════════════════════════════════
-// GLOBAL TIME HELPERS
+// PLAYABLE TIME HELPERS
 // ═══════════════════════════════════════════════════════════
-function getGlobalTime() {
+function getPlayableTime() {
   if (currentSegment < 0 || !segmentLoaded) return 0;
-  return segStarts[currentSegment] + (videos[0].currentTime || 0);
+  return segOffsets[currentSegment] + (videos[0].currentTime || 0);
 }
 
-function seekGlobal(globalTime) {
-  const { segIndex, localTime } = resolveGlobalTime(globalTime);
+function seekPlayable(pt) {
+  const { segIndex, localTime } = resolvePlayableTime(pt);
   if (segIndex === currentSegment && segmentLoaded) {
     seekLocal(localTime);
-    updateTimelineFromGlobal();
+    updateTimelineDisplay();
   } else {
     loadSegment(segIndex, localTime, isPlaying);
   }
@@ -591,20 +625,26 @@ function syncVideos() {
 }
 
 // ═══════════════════════════════════════════════════════════
-// CONTINUOUS TIMELINE
+// CONTINUOUS TIMELINE — WALL CLOCK DISPLAY
 // ═══════════════════════════════════════════════════════════
-function updateTimelineFromGlobal() {
-  const gt = getGlobalTime();
-  const pct = Math.min(100, (gt / totalDuration) * 100);
+function updateTimelineDisplay() {
+  const pt = getPlayableTime();
+  const pct = Math.min(100, (pt / totalDuration) * 100);
   timelineFill.style.width = pct + '%';
   timelineThumb.style.left = pct + '%';
-  timeDisplay.textContent = formatTime(gt) + ' / ' + formatTime(totalDuration);
-}
 
-function formatTime(s) {
-  const m = Math.floor(s / 60);
-  const sec = Math.floor(s % 60);
-  return String(m).padStart(2, '0') + ':' + String(sec).padStart(2, '0');
+  const currentWall = formatWallClock(playableToWallClock(pt));
+  const startWall = formatWallClock(new Date(timelineStartMs));
+  const endWall = formatWallClock(new Date(timelineEndMs));
+  timeDisplay.textContent = `${currentWall}`;
+
+  // Update header with current wall-clock range
+  if (currentSegment >= 0) {
+    const seg = segments[currentSegment];
+    const localT = videos[0] ? videos[0].currentTime : 0;
+    const nowMs = seg._startMs + localT * 1000;
+    segInfo.textContent = formatWallClock(new Date(nowMs));
+  }
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -612,10 +652,9 @@ function formatTime(s) {
 // ═══════════════════════════════════════════════════════════
 function tick() {
   if (isPlaying && !isScrubbing && segmentLoaded) {
-    updateTimelineFromGlobal();
+    updateTimelineDisplay();
     syncVideos();
 
-    // Check if current segment ended → advance
     const primary = videos[0];
     if (primary.ended || primary.currentTime >= segments[currentSegment].duration - 0.05) {
       if (currentSegment < segments.length - 1) {
@@ -638,8 +677,8 @@ function scrubFromEvent(e) {
   const rect = timelineTrack.getBoundingClientRect();
   const clientX = e.touches ? e.touches[0].clientX : e.clientX;
   const ratio = Math.max(0, Math.min(1, (clientX - rect.left) / rect.width));
-  const globalTime = ratio * totalDuration;
-  seekGlobal(globalTime);
+  const pt = ratio * totalDuration;
+  seekPlayable(pt);
 }
 
 timelineContainer.addEventListener('pointerdown', (e) => {
@@ -663,26 +702,25 @@ btnPlay.addEventListener('click', () => {
 });
 
 btnPrev.addEventListener('click', () => {
-  // Jump to start of current segment, or previous if already near start
   const localTime = videos[0] ? videos[0].currentTime : 0;
   if (localTime > 1 && currentSegment >= 0) {
-    seekGlobal(segStarts[currentSegment]);
+    seekPlayable(segOffsets[currentSegment]);
   } else if (currentSegment > 0) {
-    seekGlobal(segStarts[currentSegment - 1]);
+    seekPlayable(segOffsets[currentSegment - 1]);
   }
 });
 
 btnNext.addEventListener('click', () => {
   if (currentSegment < segments.length - 1) {
-    seekGlobal(segStarts[currentSegment + 1]);
+    seekPlayable(segOffsets[currentSegment + 1]);
   }
 });
 
 // Keyboard
 document.addEventListener('keydown', (e) => {
   if (e.code === 'Space') { e.preventDefault(); btnPlay.click(); }
-  if (e.code === 'ArrowLeft') seekGlobal(getGlobalTime() - 5);
-  if (e.code === 'ArrowRight') seekGlobal(getGlobalTime() + 5);
+  if (e.code === 'ArrowLeft') seekPlayable(getPlayableTime() - 5);
+  if (e.code === 'ArrowRight') seekPlayable(getPlayableTime() + 5);
 });
 
 // ═══════════════════════════════════════════════════════════
@@ -691,7 +729,7 @@ document.addEventListener('keydown', (e) => {
 buildGrid();
 buildSegmentMarkers();
 loadSegment(0, 0, false);
-log(`Player init: ${segments.length} segments, ${formatTime(totalDuration)} total`);
+log(`Player init: ${segments.length} segments, ${formatWallClock(new Date(timelineStartMs))} — ${formatWallClock(new Date(timelineEndMs))}`);
 </script>
 </body>
 </html>
